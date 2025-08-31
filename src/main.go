@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
 
 var upgrader = websocket.Upgrader{
@@ -18,6 +19,24 @@ var upgrader = websocket.Upgrader{
 }
 
 func main() {
+	// Load .env file if present
+	_ = godotenv.Load()
+
+	// Demonstrate prompting the AI (which may invoke web search internally)
+	ctx := context.Background()
+	prompt := "What are some common concurrency patterns in Go?"
+	log.Printf("Prompting AI (ollama): %s", prompt)
+	aiResponse := ""
+	err := ai.Stream(ctx, "ollama", prompt, func(chunk string) {
+		log.Printf("AI chunk: %s", chunk)
+		aiResponse += chunk + " "
+	})
+	if err != nil {
+		log.Printf("AI error: %v", err)
+	} else {
+		log.Printf("AI full response: %s", aiResponse)
+	}
+
 	ginrouter := gin.Default()
 
 	ginrouter.GET("/health", func(c *gin.Context) {

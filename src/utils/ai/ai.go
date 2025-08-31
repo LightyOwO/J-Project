@@ -8,10 +8,89 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 )
+
+// WebSearcher is an interface for web search providers.
+type WebSearcher interface {
+	Search(ctx context.Context, query string) ([]string, error)
+}
+
+// WebSearchProvider is a registry for web search providers by name.
+var webSearchProviders = map[string]WebSearcher{}
+
+// RegisterWebSearcher registers a web search provider by name.
+func RegisterWebSearcher(name string, ws WebSearcher) {
+	webSearchProviders[name] = ws
+}
+
+// SearchWeb performs a web search using the specified provider.
+// If providerName is empty or not found, it falls back to the mock provider.
+func SearchWeb(ctx context.Context, providerName, query string) ([]string, error) {
+	if providerName == "" {
+		providerName = "mock"
+	}
+	if ws, ok := webSearchProviders[providerName]; ok {
+		return ws.Search(ctx, query)
+	}
+	return (&MockWebSearcher{}).Search(ctx, query)
+}
+
+// MockWebSearcher is a fallback web search provider for testing.
+type MockWebSearcher struct{}
+
+func (m *MockWebSearcher) Search(ctx context.Context, query string) ([]string, error) {
+	return []string{"This is a mock search result for: " + query}, nil
+}
+
+// DuckDuckGoWebSearcher implements WebSearcher using DuckDuckGo's Instant Answer API.
+type DuckDuckGoWebSearcher struct{}
+
+func (d *DuckDuckGoWebSearcher) Search(ctx context.Context, query string) ([]string, error) {
+	// Use DuckDuckGo's Instant Answer API (no API key required)
+	endpoint := "https://api.duckduckgo.com/?q=" + url.QueryEscape(query) + "&format=json&no_redirect=1&no_html=1"
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, errors.New("duckduckgo: bad status " + resp.Status + " body: " + string(data))
+	}
+	var result struct {
+		RelatedTopics []struct {
+			Text     string `json:"Text"`
+			FirstURL string `json:"FirstURL"`
+		} `json:"RelatedTopics"`
+		AbstractText string `json:"AbstractText"`
+		AbstractURL  string `json:"AbstractURL"`
+	}
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(&result); err != nil {
+		return nil, err
+	}
+	var out []string
+	if result.AbstractText != "" {
+		out = append(out, result.AbstractText+" ("+result.AbstractURL+")")
+	}
+	for _, t := range result.RelatedTopics {
+		if t.Text != "" && t.FirstURL != "" {
+			out = append(out, t.Text+" ("+t.FirstURL+")")
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, "No results found.")
+	}
+	return out, nil
+}
 
 type StreamHandler func(chunk string)
 
@@ -152,6 +231,7 @@ func (h *HTTPProvider) Stream(ctx context.Context, prompt string, handler Stream
 
 	// stream: read line-delimited/chunked body and call handler for each non-empty line
 	reader := bufio.NewReader(resp.Body)
+	isOllama := strings.Contains(strings.ToLower(h.Endpoint), "ollama") || strings.Contains(strings.ToLower(h.Endpoint), "11434")
 	for {
 		select {
 		case <-ctx.Done():
@@ -170,11 +250,39 @@ func (h *HTTPProvider) Stream(ctx context.Context, prompt string, handler Stream
 		if line == "" {
 			continue
 		}
-		handler(line)
+		if isOllama {
+			// Try to parse as JSON and extract 'response' field
+			var chunk struct {
+				Response string `json:"response"`
+			}
+			if err := json.Unmarshal([]byte(line), &chunk); err == nil && chunk.Response != "" {
+				handler(chunk.Response)
+			}
+			// else ignore or log parse errors
+		} else {
+			handler(line)
+		}
 	}
 }
 
 func init() {
 	// register builtin mock provider
 	Register("mock", &MockProvider{})
+
+	// Register Ollama provider using environment variables
+	ollamaEndpoint := os.Getenv("OLLAMA_ENDPOINT")
+	if ollamaEndpoint == "" {
+		ollamaEndpoint = "http://localhost:11434/api/generate"
+	}
+	ollamaModel := os.Getenv("OLLAMA_MODEL")
+	if ollamaModel == "" {
+		ollamaModel = "llama3"
+	}
+	ollamaApiKeyEnv := "OLLAMA_API_KEY"
+	ollama := NewHTTPProvider(ollamaEndpoint, ollamaApiKeyEnv, ollamaModel, true)
+	Register("ollama", ollama)
+
+	// register DuckDuckGo web search provider
+	RegisterWebSearcher("duckduckgo", &DuckDuckGoWebSearcher{})
+	RegisterWebSearcher("mock", &MockWebSearcher{})
 }
